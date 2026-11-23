@@ -21,6 +21,9 @@ spec:
         - name: Phase
           type: string
           jsonPath: .status.phase
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Ready")].status
         - name: Workflow
           type: string
           jsonPath: .status.workflow.workflowID

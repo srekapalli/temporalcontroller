@@ -67,7 +67,7 @@ func run(log *slog.Logger, kubeconfig, watchNamespace, temporalAddress, temporal
 	if runWorker {
 		w := worker.New(tc, taskQueue, worker.Options{})
 		w.RegisterWorkflowWithOptions(workflow.ApplicationManifestWorkflow, sdkworkflow.RegisterOptions{Name: workflow.WorkflowName})
-		w.RegisterActivity(&workflow.Activities{})
+		w.RegisterActivity(&workflow.Activities{K8s: dyn})
 		if err := w.Start(); err != nil {
 			return err
 		}

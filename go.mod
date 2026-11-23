@@ -3,6 +3,7 @@ module github.com/srekapalli/temporalcontroller
 go 1.24.1
 
 require (
+	github.com/stretchr/testify v1.10.0
 	go.temporal.io/api v1.49.1
 	go.temporal.io/sdk v1.35.0
 	k8s.io/apimachinery v0.33.4
@@ -37,7 +38,6 @@ require (
 	github.com/robfig/cron v1.2.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
-	github.com/stretchr/testify v1.10.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	golang.org/x/net v0.39.0 // indirect
 	golang.org/x/oauth2 v0.27.0 // indirect

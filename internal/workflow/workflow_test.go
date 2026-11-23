@@ -1,12 +1,60 @@
 package workflow
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
+	"github.com/stretchr/testify/mock"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 
 	"github.com/srekapalli/temporalcontroller/api/v1alpha1"
+)
+
+// newFakeK8s returns a fake dynamic client holding one ApplicationManifest shop/checkout at the given generation.
+func newFakeK8s(generation int64) dynamic.Interface {
+	u := &unstructured.Unstructured{}
+	u.SetAPIVersion(v1alpha1.Group + "/" + v1alpha1.Version)
+	u.SetKind(v1alpha1.Kind)
+	u.SetNamespace("shop")
+	u.SetName("checkout")
+	u.SetGeneration(generation)
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{v1alpha1.GroupVersionResource: v1alpha1.Kind + "List"}, u)
+}
+
+func getStatus(t *testing.T, k8s dynamic.Interface) v1alpha1.ApplicationManifestStatus {
+	t.Helper()
+	u, err := k8s.Resource(v1alpha1.GroupVersionResource).Namespace("shop").Get(context.Background(), "checkout", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var am v1alpha1.ApplicationManifest
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &am); err != nil {
+		t.Fatal(err)
+	}
+	return am.Status
+}
+
+func findCondition(conds []metav1.Condition, condType string) *metav1.Condition {
+	for i := range conds {
+		if conds[i].Type == condType {
+			return &conds[i]
+		}
+	}
+	return nil
+}
+
+var (
+	mockAny      = mock.Anything
+	errImagePull = temporal.NewNonRetryableApplicationError("ErrImagePull: ghcr.io/acme/checkout:1.4.2", "ImagePull", nil)
 )
 
 // checkoutSpec mirrors examples/checkout.yaml.
@@ -41,7 +89,8 @@ func checkoutSpec() v1alpha1.ApplicationManifestSpec {
 func TestCheckoutWorkflowResult(t *testing.T) {
 	var s testsuite.WorkflowTestSuite
 	env := s.NewTestWorkflowEnvironment()
-	env.RegisterActivity(&Activities{})
+	k8s := newFakeK8s(3)
+	env.RegisterActivity(&Activities{K8s: k8s})
 
 	env.ExecuteWorkflow(ApplicationManifestWorkflow, Input{Namespace: "shop", Name: "checkout", Generation: 3, Spec: checkoutSpec()})
 	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
@@ -91,6 +140,78 @@ func TestCheckoutWorkflowResult(t *testing.T) {
 			t.Errorf("step %s phase = %s, want Succeeded", p.Name, p.Phase)
 		}
 		t.Logf("step %-13s %-9s %s", p.Name, p.Phase, p.Message)
+	}
+
+	status := getStatus(t, k8s)
+	if status.Phase != v1alpha1.PhaseSucceeded {
+		t.Errorf("phase = %q, want Succeeded", status.Phase)
+	}
+	wantConds := []string{
+		ConditionReady,
+		ConditionClusterResolved,
+		"RedisHelmReleaseInstalled",
+		"CheckoutApiWorkloadDeployed",
+		"CheckoutApiGatewayRouteConfigured",
+		ConditionNotificationSent,
+	}
+	for _, ct := range wantConds {
+		c := findCondition(status.Conditions, ct)
+		if c == nil || c.Status != metav1.ConditionTrue || c.ObservedGeneration != 3 {
+			t.Errorf("condition %s = %+v, want True at generation 3", ct, c)
+		}
+	}
+	for _, c := range status.Conditions {
+		t.Logf("condition %-34s %-5s %-11s %s", c.Type, c.Status, c.Reason, c.Message)
+	}
+}
+
+func TestFailedActivitySetsConditions(t *testing.T) {
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestWorkflowEnvironment()
+	k8s := newFakeK8s(1)
+	acts := &Activities{K8s: k8s}
+	env.RegisterActivity(acts)
+	env.OnActivity(acts.DeployWorkload, mockAny, mockAny).Return(Deployment{}, errImagePull)
+
+	env.ExecuteWorkflow(ApplicationManifestWorkflow, Input{Namespace: "shop", Name: "checkout", Generation: 1, Spec: checkoutSpec()})
+	if env.GetWorkflowError() == nil {
+		t.Fatal("expected workflow to fail")
+	}
+
+	status := getStatus(t, k8s)
+	if status.Phase != v1alpha1.PhaseFailed {
+		t.Errorf("phase = %q, want Failed", status.Phase)
+	}
+	if c := findCondition(status.Conditions, "RedisHelmReleaseInstalled"); c == nil || c.Status != metav1.ConditionTrue {
+		t.Errorf("redis condition = %+v, want True", c)
+	}
+	if c := findCondition(status.Conditions, "CheckoutApiWorkloadDeployed"); c == nil || c.Status != metav1.ConditionFalse || c.Reason != "Failed" {
+		t.Errorf("checkout-api condition = %+v, want False/Failed", c)
+	}
+	if c := findCondition(status.Conditions, ConditionReady); c == nil || c.Status != metav1.ConditionFalse || c.Reason != "Failed" {
+		t.Errorf("Ready = %+v, want False/Failed", c)
+	}
+	if c := findCondition(status.Conditions, "CheckoutApiGatewayRouteConfigured"); c != nil {
+		t.Errorf("gateway condition should not be set after deploy failure, got %+v", c)
+	}
+}
+
+func TestUpdateManifestStatusIgnoresStaleGeneration(t *testing.T) {
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestActivityEnvironment()
+	k8s := newFakeK8s(5)
+	acts := &Activities{K8s: k8s}
+	env.RegisterActivity(acts)
+
+	_, err := env.ExecuteActivity(acts.UpdateManifestStatus, UpdateManifestStatusInput{
+		Namespace: "shop", Name: "checkout", Generation: 4, Phase: v1alpha1.PhaseRunning,
+		Conditions: []metav1.Condition{condition(ConditionReady, false, "Progressing", "old workflow")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := getStatus(t, k8s); status.Phase != "" || len(status.Conditions) != 0 {
+		t.Errorf("stale write was applied: %+v", status)
 	}
 }
 

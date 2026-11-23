@@ -172,9 +172,8 @@ func (w *Watcher) reconcile(ctx context.Context, key string) error {
 		w.cancel(ctx, prev.WorkflowID, "superseded by generation", am.Generation)
 	}
 
+	// phase, message and conditions are owned by the workflow (UpdateManifestStatus), so they're not touched here.
 	return w.patchStatus(ctx, am, map[string]any{
-		"phase":   nil,
-		"message": nil,
 		"workflow": map[string]any{
 			"observedGeneration": am.Generation,
 			"workflowID":         run.GetID(),

@@ -8,13 +8,95 @@ import (
 	"time"
 
 	"go.temporal.io/sdk/activity"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/srekapalli/temporalcontroller/api/v1alpha1"
 )
 
 // Activities are stubs: they log what they would do and return made-up but plausible results.
-// Register with worker.RegisterActivity(&Activities{}); each method is registered under its own name.
-type Activities struct{}
+// The exception is UpdateManifestStatus, which writes to the ApplicationManifest's status.
+// Register with worker.RegisterActivity(&Activities{...}); each method is registered under its own name.
+type Activities struct {
+	// K8s is used by UpdateManifestStatus. If nil, status updates are logged and skipped.
+	K8s dynamic.Interface
+}
+
+// UpdateManifestStatus
+
+type UpdateManifestStatusInput struct {
+	Namespace  string `json:"namespace"`
+	Name       string `json:"name"`
+	Generation int64  `json:"generation"`
+	// Phase and Message are written only when Phase is set.
+	Phase      v1alpha1.Phase     `json:"phase,omitempty"`
+	Message    string             `json:"message,omitempty"`
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// UpdateManifestStatus merges conditions into the ApplicationManifest's status.
+// Writes from a workflow whose generation no longer matches the object are ignored, and conditions left
+// from older generations are dropped, so a superseded workflow can't overwrite a newer one's status.
+func (a *Activities) UpdateManifestStatus(ctx context.Context, in UpdateManifestStatusInput) error {
+	logger := activity.GetLogger(ctx)
+	if a.K8s == nil {
+		logger.Info("No Kubernetes client, skipping status update", "phase", in.Phase, "conditions", len(in.Conditions))
+		return nil
+	}
+	res := a.K8s.Resource(v1alpha1.GroupVersionResource).Namespace(in.Namespace)
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		u, err := res.Get(ctx, in.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			logger.Info("ApplicationManifest is gone, skipping status update", "name", in.Name)
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if u.GetGeneration() != in.Generation {
+			logger.Info("Stale generation, skipping status update", "workflowGeneration", in.Generation, "objectGeneration", u.GetGeneration())
+			return nil
+		}
+
+		var am v1alpha1.ApplicationManifest
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &am); err != nil {
+			return err
+		}
+		conds := make([]metav1.Condition, 0, len(am.Status.Conditions)+len(in.Conditions))
+		for _, c := range am.Status.Conditions {
+			if c.ObservedGeneration >= in.Generation {
+				conds = append(conds, c)
+			}
+		}
+		for _, c := range in.Conditions {
+			c.ObservedGeneration = in.Generation
+			meta.SetStatusCondition(&conds, c)
+		}
+		am.Status.Conditions = conds
+		if in.Phase != "" {
+			am.Status.Phase = in.Phase
+			am.Status.Message = in.Message
+		}
+
+		status, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&am.Status)
+		if err != nil {
+			return err
+		}
+		u.Object["status"] = status
+		if _, err := res.UpdateStatus(ctx, u, metav1.UpdateOptions{}); err != nil {
+			return err
+		}
+		for _, c := range in.Conditions {
+			logger.Info("Set condition", "type", c.Type, "status", c.Status, "reason", c.Reason)
+		}
+		return nil
+	})
+}
 
 // ResolveTargetCluster
 
