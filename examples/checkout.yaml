@@ -1,0 +1,39 @@
+apiVersion: apps.temporalcontroller.io/v1alpha1
+kind: ApplicationManifest
+metadata:
+  name: checkout
+  namespace: default
+spec:
+  components:
+    - name: redis
+      type: helm
+      properties: { chart: bitnami/redis, version: "19.0.1" }
+    - name: checkout-api
+      type: webservice
+      dependsOn: [redis]
+      properties:
+        image: ghcr.io/acme/checkout:1.4.2
+        port: 8080
+        env: [{ name: REDIS_HOST, value: redis-master }]
+      traits:
+        - type: scaler
+          properties: { replicas: 4 }
+        - type: gateway
+          properties: { host: checkout.acme.dev, path: / }
+  policies:
+    - name: prod-only
+      type: topology
+      properties: { clusters: [prod-us-east] }
+  workflow:
+    mode: StepByStep
+    steps:
+      - name: deploy-redis
+        type: apply-component
+        properties: { component: redis }
+        timeout: 5m
+      - name: deploy-api
+        type: apply-component
+        properties: { component: checkout-api }
+      - name: notify
+        type: notification
+        properties: { slack: { channel: "#deploys" } }
